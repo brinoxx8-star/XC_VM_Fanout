@@ -213,7 +213,13 @@ func (m *Manager) serveMonitorStates(w http.ResponseWriter, _ *http.Request) {
 //
 // "remux_source_file": `xc_fanout remux -source_file` reads the source URL and
 // its fetch options from a file, so they stay out of /proc/<pid>/cmdline.
-var Features = []string{"remux", "drop_connection", "files", "file_urls", "remux_source_file"}
+//
+// "probox_ring_resync": a parked live-TS follower whose block is pruned when the
+// signal returns is re-seated at the live edge instead of getting EOF, and the
+// ring clock reads a step larger than the window, or one after producer
+// silence, as an outage (viewer_resync, ring_gap_discontinuity_sec). Appended at
+// the END of the list: a panel reading it by name is unaffected.
+var Features = []string{"remux", "drop_connection", "files", "file_urls", "remux_source_file", "probox_ring_resync"}
 
 // EnableSupervision gives the manager an encoder supervisor. Streams are only
 // supervised once the panel PUTs a spec for one, so enabling this changes

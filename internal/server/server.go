@@ -116,6 +116,7 @@ type Stream struct {
 	sourcePath atomic.Value
 
 	lastData atomic.Int64 // UnixNano of the last non-empty Publish (0 = never); off-air signal
+	resyncs  atomic.Int64 // live-TS followers re-seated instead of dropped as behind ("stats" line, /streams/<id>)
 	// publishedBytes counts everything fed into the fan-out, so the stream's
 	// bitrate can be measured by differencing it rather than estimated by
 	// ffprobing a segment. Atomic: it is written on the publish hot path.
@@ -854,6 +855,10 @@ type streamStatus struct {
 	Refs        int   `json:"refs"`
 	HasData     bool  `json:"has_data"`
 	SinceDataMs int64 `json:"since_data_ms"` // ms since last non-empty publish; -1 if never
+	// Resyncs: live-TS followers re-seated at the live edge instead of dropped
+	// as "fell behind" since the stream was created. Appended last; the panel
+	// reads keys by name and ignores it.
+	Resyncs int64 `json:"resyncs"`
 }
 
 func (s *Stream) status() streamStatus {
@@ -861,7 +866,7 @@ func (s *Stream) status() streamStatus {
 	running, refs := s.running, s.refs
 	s.mu.Unlock()
 	ld := s.lastData.Load()
-	st := streamStatus{Running: running, Refs: refs, HasData: s.onAir(), SinceDataMs: -1}
+	st := streamStatus{Running: running, Refs: refs, HasData: s.onAir(), SinceDataMs: -1, Resyncs: s.resyncs.Load()}
 	if ld != 0 {
 		st.SinceDataMs = time.Since(time.Unix(0, ld)).Milliseconds()
 	}
@@ -924,6 +929,18 @@ type Manager struct {
 	// garbage to hand back and can bypass its rate floor for it.
 	viewerIdleNS       atomic.Int64
 	gatedSinceScavenge atomic.Bool
+
+	// Ring resync (config.json: viewer_resync, viewer_resync_max_per_min,
+	// ring_gap_discontinuity_sec; live). viewerResync: a live-TS follower that
+	// was at the edge and is reported behind less than one ring window of
+	// wall-clock time later is re-seated instead of dropped;
+	// viewerResyncMaxPerMin caps the re-seats per session and minute (0 = no
+	// cap); ringGapDiscNS is the producer silence that turns the next PCR step
+	// into an outage.
+	viewerResync          atomic.Bool
+	viewerResyncMaxPerMin atomic.Int64
+	ringGapDiscNS         atomic.Int64
+	resyncs               atomic.Int64 // re-seats served since boot ("stats" line)
 
 	ingestDir string // base dir for per-stream push-fed ingest sockets
 
@@ -1008,6 +1025,9 @@ func NewManager(maxGOP int, maxPrebufMS int64, hlsTarget float64, hlsWindow int,
 	m.idleBufferGraceNS.Store(int64(time.Duration(defaults.CfgIdleBufferGraceSec) * time.Second))
 	m.idleBufferRatioBits.Store(math.Float64bits(defaults.CfgIdleBufferRatio))
 	m.viewerIdleNS.Store(int64(time.Duration(defaults.CfgViewerIdleTimeoutSec) * time.Second))
+	m.viewerResync.Store(defaults.CfgViewerResync)
+	m.viewerResyncMaxPerMin.Store(int64(defaults.CfgViewerResyncMaxPerMin))
+	m.ringGapDiscNS.Store(int64(time.Duration(defaults.CfgRingGapDiscontinuitySec) * time.Second))
 	return m
 }
 
@@ -1059,6 +1079,9 @@ func (m *Manager) ApplyConfig(v config.Values) {
 	m.idleBufferGraceNS.Store(int64(time.Duration(v.IdleBufferGraceSec) * time.Second))
 	m.idleBufferRatioBits.Store(math.Float64bits(v.IdleBufferRatio))
 	m.viewerIdleNS.Store(int64(time.Duration(v.ViewerIdleTimeoutSec) * time.Second))
+	m.viewerResync.Store(v.ViewerResync)
+	m.viewerResyncMaxPerMin.Store(int64(v.ViewerResyncMaxPerMin))
+	m.ringGapDiscNS.Store(int64(time.Duration(v.RingGapDiscontinuitySec) * time.Second))
 
 	// Update the new-stream defaults and snapshot the live set under m.mu, then
 	// reconfigure each stream outside the lock (each takes its own hub/seg lock;
@@ -1102,6 +1125,7 @@ func (m *Manager) applyBufferLocked(st *Stream) {
 	st.Hub.Configure(m.maxPrebufMS.Load(), m.hlsTargetMS.Load(), int(m.hlsWindow.Load()))
 	st.Hub.SetIdleRatio(m.idleRatio())
 	st.Hub.SetGated(!st.buffered)
+	st.Hub.SetGapDiscontinuity(time.Duration(m.ringGapDiscNS.Load()))
 }
 
 // reapMinInterval / reapMaxInterval bound the sweep cadence. The floor keeps a
@@ -1333,8 +1357,8 @@ func (m *Manager) StartDebugStats(ctx context.Context, every time.Duration) {
 					// nokf > 0 means the source carries no random_access_indicator: the
 					// ring is being cut on the byte cap instead of on keyframes, and
 					// HLS cannot produce segments for it at all.
-					dlog.Logf("stats", "id=%s mode=%s running=%v route=%s refs=%d conns=%d data_age=%s nokf=%d",
-						st.id, mode, running, route, refs, conns, dataAge, st.Hub.NoKeyframeCuts())
+					dlog.Logf("stats", "id=%s mode=%s running=%v route=%s refs=%d conns=%d data_age=%s nokf=%d resyncs=%d",
+						st.id, mode, running, route, refs, conns, dataAge, st.Hub.NoKeyframeCuts(), st.resyncs.Load())
 				}
 			}
 		}
@@ -1440,6 +1464,7 @@ func (m *Manager) GetOrCreate(id string) *Stream {
 		// fraction if it draws no audience.
 		st.Hub.Configure(m.maxPrebufMS.Load(), m.hlsTargetMS.Load(), int(m.hlsWindow.Load()))
 		st.Hub.SetIdleRatio(m.idleRatio())
+		st.Hub.SetGapDiscontinuity(time.Duration(m.ringGapDiscNS.Load()))
 		m.streams[id] = st
 		dlog.Logf("stream", "id=%s created", id)
 	}
@@ -2275,6 +2300,59 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	// Ring resync. "behind" means "the ring advanced more than its window in
+	// STREAM TIME past the cursor's block", and that happens to a slow link and
+	// to a follower parked at the edge alike when the stream comes back from a
+	// gap with a PCR jump, with a producer restart or in a burst (minutes of
+	// video in a second): its block was pruned in the same Update that brought
+	// the data back and all 100 viewers of a channel got EOF at once ("fell
+	// behind the ring", measured on production load balancers).
+	//
+	// What tells the two apart is the wall clock: the ring window is the slack
+	// a follower has in REAL time. edgeAt is the last time this follower had
+	// nothing pending (Follow returned atEnd, or it has just joined); if it is
+	// reported behind less than one window after that, it is not slow — the
+	// stream ran faster than the clock. It is then re-seated where a new viewer
+	// would join — PAT+PMT and its prebuffer, Hub.Join — and keeps its socket;
+	// the player sees a discontinuity, not an EOF. A follower that has gone a
+	// whole window without reaching the edge really is slower than the stream
+	// and is closed as always; the per-minute cap cuts off one that would have
+	// to be re-seated without end (a source jumping continuously).
+	edgeAt := time.Now()
+	nResync := 0
+	var lastResync time.Time
+	var episodes []time.Time // start of each resync episode (for the per-minute cap)
+	resync := func(now time.Time) bool {
+		if !m.viewerResync.Load() {
+			return false
+		}
+		window := time.Duration(st.Hub.Window()) * time.Millisecond
+		if window <= 0 || now.Sub(edgeAt) >= window {
+			return false // a whole window without reaching the edge: genuinely slow
+		}
+		// Per-minute cap, counted in EPISODES: while a burst lasts, a fast
+		// follower can fall behind and be re-seated several times within the
+		// same second (it reads between two chunks and the ring overtakes it
+		// again); that is one outage of the source, not six. Re-seats less than
+		// resyncEpisodeGap after the previous one belong to the same episode.
+		if max := int(m.viewerResyncMaxPerMin.Load()); max > 0 && (lastResync.IsZero() || now.Sub(lastResync) >= resyncEpisodeGap) {
+			keep := episodes[:0]
+			for _, t := range episodes {
+				if now.Sub(t) < time.Minute {
+					keep = append(keep, t)
+				}
+			}
+			episodes = keep
+			if len(episodes) >= max {
+				return false
+			}
+			episodes = append(episodes, now)
+		}
+		lastResync = now
+		return true
+	}
+
 	for {
 		// Admin "send message" overlay (rare): burn it onto a short window via a
 		// transient ffmpeg fed from the ring, then resume the raw fan-out from where
@@ -2308,9 +2386,30 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		if now := time.Now(); now.Sub(runMeasured) >= runResizeEvery {
 			runMax, runMeasured = m.runBytes(st, now), now
 		}
+		followAt := time.Now()
 		burst, next, atEnd, wake, behind, ended := st.Hub.Follow(cur, runMax)
 		if behind {
 			burst.Release()
+			if now := followAt; resync(now) {
+				var rhead []byte
+				rhead, cur = st.Hub.Join(prebufMS)
+				nResync++
+				m.resyncs.Add(1)
+				st.resyncs.Add(1)
+				dlog.Logf("viewer", "id=%s live resync uuid=%s n=%d since_edge=%s prebuffer=%dms (ring moved past a parked follower: re-seated, not dropped)",
+					id, uuid, nResync, now.Sub(edgeAt).Round(time.Millisecond), prebufMS)
+				// edgeAt is NOT refreshed here: only reaching the edge again (atEnd)
+				// proves the follower keeps up. A burst longer than the window in
+				// wall-clock time ends up closing it as slow, which is what it is
+				// from its link's point of view.
+				if len(rhead) > 0 {
+					if err := write(rhead); err != nil {
+						reason = writeFailReason(err)
+						return
+					}
+				}
+				continue
+			}
 			reason = "dropped: fell behind the ring (link slower than the stream)"
 			return
 		}
@@ -2352,10 +2451,30 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 			resetIdle()
 		}
 		if atEnd {
+			// Nothing pending at the instant of that Follow: the resync window
+			// counts from there. The Follow instant, not now: however long the
+			// run took to write (a client that does not drain) counts against
+			// the follower, which is what tells it from a parked one.
+			edgeAt = followAt
+			// New data already there (the wake closed while the run was being
+			// written): do not park. The time that passed was the write's, not a
+			// gap's, and counts against the follower.
+			parked := true
+			select {
+			case <-wake:
+				parked = false
+			default:
+			}
+			if !parked {
+				continue
+			}
 			select {
 			case <-wake:
 				// New data landed (or the stream was torn down, which the next
-				// Follow reports as ended). Loop and read it.
+				// Follow reports as ended). Loop and read it. Until this wake-up
+				// there was nothing to read — a source gap, however long, is not
+				// slowness of the follower — so the edge is NOW.
+				edgeAt = time.Now()
 			case <-idleC:
 				reason = "no data for " + idleTimeout.String() + " (source off-air; dropped)"
 				return
@@ -2369,6 +2488,11 @@ func (m *Manager) serveLive(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 }
+
+// resyncEpisodeGap separates two resync episodes of one follower for the
+// viewer_resync_max_per_min cap: re-seats closer than this are the same outage
+// of the source seen several times.
+const resyncEpisodeGap = 2 * time.Second
 
 // writeFailReason labels why a live-TS write failed: a stall past the per-write
 // deadline (a backgrounded/half-open player whose socket buffer filled) reads

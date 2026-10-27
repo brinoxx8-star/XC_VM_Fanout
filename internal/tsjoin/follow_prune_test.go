@@ -60,6 +60,11 @@ func TestReaderThatMissedPartOfAPrunedBlockIsBehind(t *testing.T) {
 	s.Unpin(pin)
 	s.Update(filler) // lands after the read
 	s.Update(keyPCR(4 * tick))
+	// A step larger than the window (4 s > 2 s) no longer ages the ring by more
+	// than the window itself, so the first keyframe keeps the block just read
+	// one more turn; the second one releases it. The premise of the test — the
+	// block left with bytes the reader never took — then holds.
+	s.Update(keyPCR(8 * tick))
 
 	if _, _, _, behind, _ := s.ReadFrom(c, 1<<20); !behind {
 		t.Fatal("a reader that never got the pruned block's last packet was not reported behind")

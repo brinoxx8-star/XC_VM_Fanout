@@ -168,6 +168,25 @@ const (
 	// PullBackoffMax plus an ffmpeg cold start), so a recovering source does not
 	// cost viewers their connection.
 	CfgViewerIdleTimeoutSec = 30
+	// Ring resync (see tsjoin.ringClock and server.serveLive):
+	//
+	// CfgRingGapDiscontinuitySec: a forward PCR step that arrives after this
+	// much producer silence (seconds without ES packets; null packets 0x1FFF and
+	// tables do not count) is read as an outage — one cadence — rather than as
+	// elapsed stream time, so the ring is not pruned wholesale when the signal
+	// returns. 0 = off (previous behaviour).
+	CfgRingGapDiscontinuitySec = 5
+	// CfgViewerResync: a live-TS viewer that was at the ring edge (nothing
+	// pending) and whose block is pruned before one ring window of WALL-CLOCK
+	// time has passed is not slow — the stream jumped or arrived in a burst —
+	// so it is re-seated where a new viewer would join (PAT+PMT+prebuffer) and
+	// keeps its socket instead of getting EOF. false = previous behaviour.
+	CfgViewerResync = true
+	// CfgViewerResyncMaxPerMin caps the re-seats per viewer and minute (counted
+	// in 2 s episodes); past the cap the viewer is dropped as "fell behind" (a
+	// source that jumps continuously, or a client that really cannot keep up).
+	// 0 = no cap.
+	CfgViewerResyncMaxPerMin = 6
 	// CfgSourceBackend picks how a non-mp2t source is turned into MPEG-TS:
 	//
 	//	"auto"   — native where the source allows it, ffmpeg otherwise

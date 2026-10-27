@@ -56,6 +56,11 @@ type Values struct {
 	// this long (0 = never). It is what bounds a ghost connection on an off-air
 	// stream: the per-write deadline can only fire while there are bytes to write.
 	ViewerIdleTimeoutSec int `json:"viewer_idle_timeout_sec"`
+	// Ring resync (see defaults.CfgRingGapDiscontinuitySec, CfgViewerResync and
+	// CfgViewerResyncMaxPerMin): all three are applied live on every poll.
+	RingGapDiscontinuitySec int  `json:"ring_gap_discontinuity_sec"`
+	ViewerResync            bool `json:"viewer_resync"`
+	ViewerResyncMaxPerMin   int  `json:"viewer_resync_max_per_min"`
 	// MemLimitMB is an explicit ceiling (MiB) for the Go soft memory limit;
 	// 0 = derive it from the cgroup limit, else a share of the box's RAM.
 	MemLimitMB int `json:"mem_limit_mb"`
@@ -99,10 +104,14 @@ func Defaults() Values {
 		IdleBufferRatio:     defaults.CfgIdleBufferRatio,
 
 		ViewerIdleTimeoutSec: defaults.CfgViewerIdleTimeoutSec,
-		MemLimitMB:           defaults.CfgMemLimitMB,
-		SourceBackend:        defaults.CfgSourceBackend,
-		Supervise:            defaults.CfgSupervise,
-		DebugCats:            defaults.CfgDebugCats,
+
+		RingGapDiscontinuitySec: defaults.CfgRingGapDiscontinuitySec,
+		ViewerResync:            defaults.CfgViewerResync,
+		ViewerResyncMaxPerMin:   defaults.CfgViewerResyncMaxPerMin,
+		MemLimitMB:              defaults.CfgMemLimitMB,
+		SourceBackend:           defaults.CfgSourceBackend,
+		Supervise:               defaults.CfgSupervise,
+		DebugCats:               defaults.CfgDebugCats,
 	}
 }
 
@@ -122,10 +131,14 @@ type file struct {
 	IdleBufferGraceSec  *int     `json:"idle_buffer_grace_sec"`
 	IdleBufferRatio     *float64 `json:"idle_buffer_ratio"`
 
-	ViewerIdleTimeoutSec *int    `json:"viewer_idle_timeout_sec"`
-	MemLimitMB           *int    `json:"mem_limit_mb"`
-	SourceBackend        *string `json:"source_backend"`
-	Supervise            *bool   `json:"supervise"`
+	ViewerIdleTimeoutSec *int `json:"viewer_idle_timeout_sec"`
+
+	RingGapDiscontinuitySec *int    `json:"ring_gap_discontinuity_sec"`
+	ViewerResync            *bool   `json:"viewer_resync"`
+	ViewerResyncMaxPerMin   *int    `json:"viewer_resync_max_per_min"`
+	MemLimitMB              *int    `json:"mem_limit_mb"`
+	SourceBackend           *string `json:"source_backend"`
+	Supervise               *bool   `json:"supervise"`
 }
 
 // Load reads path, returns the resolved (defaults-overlaid, clamped) values, and
@@ -206,6 +219,18 @@ func Load(path string) (Values, bool, error) {
 		v.ViewerIdleTimeoutSec = *f.ViewerIdleTimeoutSec
 	}
 	overlay(f.ViewerIdleTimeoutSec != nil)
+	if f.RingGapDiscontinuitySec != nil {
+		v.RingGapDiscontinuitySec = *f.RingGapDiscontinuitySec
+	}
+	overlay(f.RingGapDiscontinuitySec != nil)
+	if f.ViewerResync != nil {
+		v.ViewerResync = *f.ViewerResync
+	}
+	overlay(f.ViewerResync != nil)
+	if f.ViewerResyncMaxPerMin != nil {
+		v.ViewerResyncMaxPerMin = *f.ViewerResyncMaxPerMin
+	}
+	overlay(f.ViewerResyncMaxPerMin != nil)
 	if f.MemLimitMB != nil {
 		v.MemLimitMB = *f.MemLimitMB
 	}
@@ -269,6 +294,10 @@ func (v *Values) clamp() {
 		v.ViewerIdleTimeoutSec = clampInt(v.ViewerIdleTimeoutSec, 5, 3600)
 	}
 	v.MemLimitMB = clampInt(v.MemLimitMB, 0, 1<<20)
+	// Ring resync: 0 disables each piece; the ceilings keep a typo from making
+	// the ring clock read every step as an outage or re-seating without bound.
+	v.RingGapDiscontinuitySec = clampInt(v.RingGapDiscontinuitySec, 0, 600)
+	v.ViewerResyncMaxPerMin = clampInt(v.ViewerResyncMaxPerMin, 0, 1000)
 	// An unknown backend falls back to the safe default rather than throwing:
 	// a typo in the panel must never stop streams from being pulled.
 	//

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/defaults"
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/tspes"
@@ -112,9 +113,21 @@ type State struct {
 	clockPCR  int64
 	clockT    int64
 	clockStep int64
-	maxGOP    int   // cap on a single GOP's length (bytes) — memory guard
-	ring90    int64 // history retained, in 90 kHz ticks (0 = current GOP only)
-	maxRing   int   // absolute byte ceiling for the whole ring — memory backstop
+
+	// Producer silence (defaults.CfgRingGapDiscontinuitySec). now is the wall
+	// clock (injectable in tests); lastDataAt the instant of the last Update that
+	// carried ES payload (null packets 0x1FFF, PAT and PMT do not count: a
+	// keepalive is not signal); gapDisc the silence after which the next forward
+	// PCR step is read as an outage (0 = off); gapPending that such a silence
+	// has happened and the first keyframe to arrive must consume it.
+	now        func() time.Time
+	lastDataAt time.Time
+	gapDisc    time.Duration
+	gapPending bool
+
+	maxGOP  int   // cap on a single GOP's length (bytes) — memory guard
+	ring90  int64 // history retained, in 90 kHz ticks (0 = current GOP only)
+	maxRing int   // absolute byte ceiling for the whole ring — memory backstop
 
 	// pinned counts, per block id, the readers holding slices into that block
 	// while they copy or write with the lock released (a Pin). prune must not
@@ -192,10 +205,32 @@ type State struct {
 // to retain for client prebuffer (0 = keep only the current GOP, the original
 // behaviour). The HLS view starts disabled; call Configure to enable it.
 func New(maxGOP int, maxPrebufMS int64) *State {
-	s := &State{pmtPID: -1, videoPID: -1, audioPID: -1, lastPCR: -1, pcrPID: -1, clockPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, segLastPTS: -1, prunedID: -1, idleRatio: 0.5}
+	s := &State{pmtPID: -1, videoPID: -1, audioPID: -1, lastPCR: -1, pcrPID: -1, clockPCR: -1, maxGOP: maxGOP, prebufMS: maxPrebufMS, segStartID: -1, segLastPTS: -1, prunedID: -1, idleRatio: 0.5, now: time.Now}
 	s.recompute()
 	return s
 }
+
+// SetGapDiscontinuity sets the producer silence (wall clock) after which the
+// next forward PCR step is treated as an outage rather than elapsed stream time
+// (see ringClock). 0 disables the rule. Caller (Hub) serialises.
+func (s *State) SetGapDiscontinuity(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.gapDisc = d
+}
+
+// SetClock replaces the wall clock that measures producer silence (tests).
+// Caller (Hub) serialises.
+func (s *State) SetClock(now func() time.Time) {
+	if now != nil {
+		s.now = now
+	}
+}
+
+// Window is the ring window in milliseconds of stream clock (what prune
+// retains by duration), 0 when there is none. Caller (Hub) serialises.
+func (s *State) Window() int64 { return s.ring90 / pcrHz }
 
 // recompute sizes the ring to the buffer (prebufMS) and its byte backstop
 // (~24 Mbit/s ≈ 3000 bytes/ms, so a stream whose PCR cannot be parsed can never
@@ -274,6 +309,17 @@ func (s *State) Configure(prebufMS, hlsTargetMS int64, hlsWindow int) {
 // Update scans a packet-aligned chunk and folds it into the join state.
 // Bytes that are not 188-aligned or lack the 0x47 sync byte are skipped.
 func (s *State) Update(chunk []byte) {
+	// Producer silence is measured in wall-clock time between two chunks that
+	// carry ES payload. It is judged once per Update (not per packet) and
+	// consumed by the first keyframe to arrive (ringClock).
+	var now time.Time
+	esData := false
+	if s.gapDisc > 0 {
+		now = s.now()
+		if !s.lastDataAt.IsZero() && now.Sub(s.lastDataAt) >= s.gapDisc {
+			s.gapPending = true
+		}
+	}
 	for off := 0; off+PacketSize <= len(chunk); off += PacketSize {
 		pkt := chunk[off : off+PacketSize]
 		if pkt[0] != 0x47 {
@@ -281,6 +327,9 @@ func (s *State) Update(chunk []byte) {
 		}
 		pid := (int(pkt[1]&0x1f) << 8) | int(pkt[2])
 		pusi := pkt[1]&0x40 != 0
+		if !esData && pkt[3]&0x10 != 0 && pid != 0 && pid != s.pmtPID && pid != 0x1fff {
+			esData = true // a payload packet outside PAT/PMT/null: real signal
+		}
 
 		// Health counters. A payload-unit-start on the video PID begins a new
 		// access unit, which is close enough to "a frame" for a rate that is only
@@ -467,6 +516,9 @@ func (s *State) Update(chunk []byte) {
 			s.prune()
 		}
 	}
+	if esData && s.gapDisc > 0 {
+		s.lastDataAt = now
+	}
 }
 
 // maxCadence bounds the step ringClock takes at face value, and so the one it
@@ -531,9 +583,32 @@ func (s *State) ringClock() int64 {
 	if d < 0 && d+ptsWrap <= maxWrap {
 		d += ptsWrap // the 33-bit PCR wrap: a forward step after all
 	}
+	// Two more rules, both bounding how much a SINGLE step may age the ring: a
+	// step that ages it whole in one go prunes every follower parked at the edge
+	// in the same Update (measured on production load balancers: "fell behind
+	// the ring" for all 100 viewers at once when the signal came back).
+	//
+	//  1. Silence (gapPending): a forward step that arrives after ≥ gapDisc of
+	//     wall-clock time without signal is an outage — the source kept
+	//     counting while it sent nothing — not stream time the followers could
+	//     have consumed: advance one cadence, like any other discontinuity (0
+	//     while no cadence is known: the clock waits for the next keyframe,
+	//     which brings one).
+	//  2. Window (ring90): a step larger than the ring's own window is never
+	//     useful time (ADR 0004: the ring is the live tail; ageing it by more
+	//     than its length empties it). Advance one cadence; with no cadence
+	//     known — the state a max_gop_bytes cut leaves, which used to take the
+	//     WHOLE step however large — exactly the window, so the block that was
+	//     the edge survives (≤) and the older ones leave. This keeps a
+	//     keyframe-less source (blocks spanning minutes) ageing and pruning,
+	//     which is what taking the full step without a cadence was there for.
+	gap := s.gapPending
+	s.gapPending = false
 	switch {
 	case d < 0:
 		d = s.clockStep // a discontinuity: carry on at the last known cadence
+	case gap && d > 0:
+		d = s.clockStep // producer silence: an outage, not elapsed time
 	case s.clockStep > 0 && d > 2*s.clockStep+s.hlsTargetMS*pcrHz:
 		// A forward step far outside the cadence — INCLUDING one still under
 		// maxCadence — is a timeline jump (a source that froze during an outage
@@ -545,6 +620,15 @@ func (s *State) ringClock() int64 {
 		// stream with no known cadence yet, clockStep == 0, still takes a forward
 		// step in full, below — that is what keeps keyframe-less radio moving.)
 		d = s.clockStep
+	case s.ring90 > 0 && d > s.ring90:
+		// What the cadence rule above lets through: no cadence known yet
+		// (clockStep == 0), which used to take the step in full. Cap it at the
+		// window (see the rule's comment above).
+		if s.clockStep > 0 {
+			d = s.clockStep // a jump longer than the window: a discontinuity
+		} else {
+			d = s.ring90 // no cadence: age one window, never more
+		}
 	case d <= maxCadence:
 		if d > 0 {
 			s.clockStep = d

@@ -17,6 +17,7 @@ package hub
 
 import (
 	"sync"
+	"time"
 
 	"github.com/Vateron-Media/XC_VM_Fanout/internal/tsjoin"
 )
@@ -261,6 +262,23 @@ func (h *Hub) SetIdleRatio(r float64) {
 	h.mu.Lock()
 	h.join.SetIdleRatio(r)
 	h.mu.Unlock()
+}
+
+// SetGapDiscontinuity sets the producer silence after which the next forward
+// PCR step is read as an outage rather than elapsed time (0 = off). Live, like
+// Configure.
+func (h *Hub) SetGapDiscontinuity(d time.Duration) {
+	h.mu.Lock()
+	h.join.SetGapDiscontinuity(d)
+	h.mu.Unlock()
+}
+
+// Window is the ring window in ms of stream clock: the slack a follower has
+// before it is reported behind.
+func (h *Hub) Window() int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.join.Window()
 }
 
 // HLSPlaylist renders the HLS media playlist from the ring's segment view, or ""

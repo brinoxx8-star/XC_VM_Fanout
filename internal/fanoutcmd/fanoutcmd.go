@@ -101,6 +101,7 @@ func Main(ver string) {
 	frontStreams := flag.String("front-streams", "/home/xc_vm/content/streams/", "STREAMS_PATH dir the front writes /progress files (<id>_.progress) under; empty leaves /progress to nginx")
 	frontAgentSock := flag.String("front-agent-sock", "", "agent unix socket the front proxies /xfile to (the Go owner side); empty leaves /xfile to nginx during the transition")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	showBuildInfo := flag.Bool("build-info", false, "print the ProBox build stamp (upstream version + patch + commit) and exit; -version stays the upstream version the panel compares")
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
 		fmt.Fprintln(out, attribution)
@@ -126,6 +127,10 @@ func Main(ver string) {
 
 	if *showVersion {
 		fmt.Println(buildVersion())
+		return
+	}
+	if *showBuildInfo {
+		fmt.Println(proboxBuildInfo(buildVersion()))
 		return
 	}
 
@@ -159,6 +164,10 @@ func Main(ver string) {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// Build stamp: the boot log identifies this build (see probox.go); -version
+	// stays the plain release version the panel compares.
+	log.Printf("xc_fanout %s", proboxBuildInfo(buildVersion()))
 
 	// Operator tuning comes from the panel-editable JSON config (the CLI no longer
 	// carries these knobs). Load self-creates a missing file with the built-in
